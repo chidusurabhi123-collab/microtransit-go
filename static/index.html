@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>MicroTransit - Live Map</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <!-- CHANGED 1: Added cluster CSS - free from GitHub -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.4.1/dist/MarkerCluster.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.4.1/dist/MarkerCluster.Default.css" />
+  <style>
+    body { margin:0; font-family: monospace; }
+    #map { height: 90vh; }
+    #header { padding:10px; background:#000; color:#0f0; display:flex; justify-content:space-between; }
+  </style>
+</head>
+<body>
+  <div id="header">
+    <div>MicroTransit-GO | 5 workers | 1000 queue | RAM ~20MB | Cluster ON</div>
+    <div id="count">0 buses live</div>
+  </div>
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <!-- CHANGED 2: Added cluster JS -->
+  <script src="https://unpkg.com/leaflet.markercluster@1.4.1/dist/leaflet.markercluster.js"></script>
+  <script>
+    const map = L.map('map').setView([12.2958, 76.6394], 13);
+    
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '© OpenStreetMap'
+    }).addTo(map);
+
+    // CHANGED 3: Create cluster group instead of adding markers directly to map
+    const clusterGroup = L.markerClusterGroup();
+    map.addLayer(clusterGroup);
+
+    let markers = {};
+
+    async function updateBuses() {
+      const res = await fetch('/api/buses');
+      const buses = await res.json();
+      
+      document.getElementById('count').innerText = buses.length + ' buses live';
+
+      buses.forEach(b => {
+        if (!markers[b.bus_id]) {
+          // New bus = add to cluster group, not directly to map
+          markers[b.bus_id] = L.marker([b.lat, b.lng])
+            .bindPopup(`<b>${b.bus_id}</b><br>Speed: ${b.speed} km/h`);
+          clusterGroup.addLayer(markers[b.bus_id]); // CHANGED 4
+        } else {
+          markers[b.bus_id].setLatLng([b.lat, b.lng]);
+        }
+      });
+    }
+
+    setInterval(updateBuses, 3000);
+    updateBuses();
+
+    map.on('click', async (e) => {
+      const bus_id = 'MYS-TEST';
+      await fetch('/api/bus/location', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({bus_id: bus_id, lat: e.latlng.lat, lng: e.latlng.lng, speed: 25})
+      });
+    });
+  </script>
+</body>
+</html>
