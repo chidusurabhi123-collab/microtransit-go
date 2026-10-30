@@ -1,451 +1,488 @@
 # MicroTransit Go
 
-A Go-based bus location tracking backend built around HTTP APIs,
-PostgreSQL persistence, and a browser-based map interface. The project
-is being developed in versions: V1 establishes the core tracking
-pipeline; future versions are planned to add performance-focused C++
-components and Python-based bus arrival-time prediction.
+A real-time bus-tracking prototype built with **Go, PostgreSQL, Python (FastAPI), Leaflet, OpenStreetMap, and OSRM**. The Go backend receives and stores GPS updates, manages route rooms and stops, and serves data to a browser map. A separate Python service exposes an ETA prediction endpoint.
 
-> **Project status:** V1 prototype / active development. The benchmark
-> figures below are local test results, not production-capacity claims.
+> **Status:** Active prototype. The Python ETA service and model-training experiment are present in the repository. The currently published Go ETA handler does not yet call the Python prediction client, so end-to-end Python ETA integration is still a work item.
 
-## Table of contents
+## Features
 
--   [Overview](#overview)
--   [Current capabilities](#current-capabilities)
--   [Architecture](#architecture)
--   [Repository structure](#repository-structure)
--   [Technology stack](#technology-stack)
--   [Run locally](#run-locally)
--   [API](#api)
--   [Load-test notes](#load-test-notes)
--   [Security and configuration](#security-and-configuration)
--   [Roadmap](#roadmap)
--   [Known limitations and next
-    steps](#known-limitations-and-next-steps)
--   [Contributing](#contributing)
+### Go backend
 
-## Overview
+- HTTP API for bus locations, buses, rooms, stops, and route-distance information.
+- PostgreSQL persistence using `pgx`.
+- Buffered GPS ingestion channel and worker goroutines.
+- Latest bus location upserted by bus ID.
+- Route rooms with an admin token returned at creation.
+- Admin-token check when adding stops.
+- Ordered route stops and stored segment-distance fields.
+- Haversine distance calculations.
 
-MicroTransit Go is a bus-location tracking project. A client submits a
-bus identifier and location to the Go HTTP server. The backend processes
-the request and stores location data in PostgreSQL. A static web
-interface is included for the map/front-end portion of the project.
+### Browser map
 
-The main V1 goal is to establish a working end-to-end path:
+- Leaflet map with OpenStreetMap tiles.
+- Bus and stop markers, including a distinct final-stop marker.
+- OSRM road geometry request with straight-line fallback.
+- Remaining-route overlay.
+- Browser geolocation control ("Track Me").
 
-1.  Receive bus location updates over HTTP.
-2.  Handle incoming requests in Go.
-3.  Process updates through the ingestion/worker component.
-4.  Persist data in PostgreSQL.
-5.  Provide a web interface for visualizing bus information.
+### Python ETA service
 
-The exact behavior of each endpoint and database operation should be
-confirmed against the current source code before treating this
-description as an API contract.
+- FastAPI application with `/health` and `/predict` endpoints.
+- ETA input fields: `distance_km` and `speed_kmh`.
+- Linear Regression model loaded from `python-eta/model.pkl` when available.
+- Training script creates a model artifact using generated synthetic data.
+- Mathematical fallback when no model artifact is available.
 
-## Current capabilities
-
--   Go server entry point under `cmd/server`.
--   Bus HTTP handler under `internal/handler`.
--   Ingestion worker under `internal/ingestor`.
--   PostgreSQL storage code under `internal/store`.
--   SQL initialization migration under `migrations`.
--   Static frontend under `static`.
--   Environment-based configuration file (`.env`, local only).
--   Local load testing of the location endpoint.
+**Important ML limitation:** `train.py` generates synthetic rows using a known distance/speed/peak-hour formula and trains a Linear Regression model on those generated labels. This is a useful integration prototype, but it is not a model trained or validated on real bus GPS histories, traffic observations, or actual arrival-time labels. Do not claim real-world ETA accuracy until that data and evaluation exist.
 
 ## Architecture
 
-``` text
-Client / Load Test
-        |
-        | POST /api/bus/location
-        v
-Go HTTP Server
-(cmd/server/main.go)
-        |
-        v
-Bus Handler
-(internal/handler/bus.go)
-        |
-        v
-Ingestion Worker
-(internal/ingestor/worker.go)
-        |
-        v
-PostgreSQL Store
-(internal/store/postgres.go)
-        |
-        v
-PostgreSQL Database
-(migrations/001_init.sql)
+```text
+Bus GPS client / load generator
+             |
+             v
+        Go HTTP API
+             |
+       +-----+---------------------+
+       |                           |
+       v                           v
+GPS ingestion queue           Room / stop handlers
+       |                           |
+       v                           v
+Worker goroutines          Route and distance logic
+       |                           |
+       +-------------+-------------+
+                     |
+                     v
+                 PostgreSQL
 
-Browser
-   |
-   v
-Static UI (static/index.html)
+Browser map <---- Go API
+     |
+     +---- OpenStreetMap tiles
+     |
+     +---- OSRM road geometry
+
+Python ETA service (FastAPI)
+     |
+     +---- /health
+     +---- /predict
+     |
+     +---- Linear Regression model artifact
+           trained by train.py on synthetic data
+
+Current integration gap:
+Go constructs an ETA client, but the published Go
+GET /api/rooms/{room_id}/eta handler does not yet call it.
 ```
-
-This diagram represents the intended component flow based on the
-repository structure. Verify the actual call path and concurrency
-behavior in the implementation.
 
 ## Repository structure
 
-``` text
+```text
 microtransit-go/
 ├── cmd/
 │   └── server/
-│       └── main.go              # Application entry point
+│       └── main.go                 # Go application wiring and routes
 ├── internal/
+│   ├── eta/
+│   │   └── client.go               # Go HTTP client for Python ETA service
+│   ├── geo/                         # Geospatial calculations
 │   ├── handler/
-│   │   └── bus.go               # Bus HTTP handlers / request handling
+│   │   ├── bus.go                   # Bus location and list handlers
+│   │   ├── room_handler.go          # Room endpoints
+│   │   └── stop_handler.go          # Stop and route-distance endpoints
 │   ├── ingestor/
-│   │   └── worker.go            # Location ingestion / worker processing
-│   ├── models/                  # Domain and data models
+│   │   └── worker.go                # Buffered queue and worker goroutines
+│   ├── models/                      # Domain models
 │   └── store/
-│       └── postgres.go          # PostgreSQL persistence layer
+│       ├── postgres.go              # PostgreSQL connection and bus storage
+│       ├── room_store.go            # Room persistence
+│       └── stop_store.go            # Stop persistence
 ├── migrations/
-│   └── 001_init.sql             # Initial database schema
+│   └── 001_init.sql                 # Initial database schema
+├── python-eta/
+│   ├── app.py                       # FastAPI application
+│   ├── models.py                    # Model loading and ETA inference/fallback
+│   ├── train.py                     # Synthetic-data model training
+│   ├── model.pkl                    # Serialized model artifact (if committed)
+│   └── requirements.txt             # Python dependencies
 ├── static/
-│   └── index.html               # Static browser interface
-├── .env                         # Local environment configuration; do not commit secrets
-├── go.mod                       # Go module and dependency declarations
-└── go.sum                       # Dependency checksums
+│   └── index.html                   # Leaflet frontend
+├── .env.example                     # Safe placeholder configuration (recommended)
+├── .gitignore                       # Exclude secrets and local artifacts (recommended)
+├── LICENSE                          # MIT License (add/commit this file)
+├── go.mod
+├── go.sum
+└── README.md
 ```
 
-### What each directory is for
-
--   **`cmd/server/`** --- executable entry point. Server setup and
-    application wiring normally live here.
--   **`internal/handler/`** --- HTTP-facing code: decoding requests,
-    validating input, and returning responses.
--   **`internal/ingestor/`** --- ingestion/worker logic for processing
-    incoming location updates.
--   **`internal/models/`** --- shared data structures representing buses
-    or location records.
--   **`internal/store/`** --- database access code, kept separate from
-    HTTP handling.
--   **`migrations/`** --- SQL schema changes used to create or evolve
-    the database.
--   **`static/`** --- frontend assets served to the browser.
--   **`.env`** --- local configuration. Keep credentials private and out
-    of version control.
--   **`go.mod` / `go.sum`** --- Go module metadata and dependency
-    integrity information.
+The tree above documents the paths inspected in the public repository and the expected local configuration files. Keep it synchronized with the actual files in your branch.
 
 ## Technology stack
 
--   **Go** --- HTTP backend and request-processing components.
--   **PostgreSQL** --- persistent storage.
--   **SQL migrations** --- database schema initialization.
--   **HTML / JavaScript** --- static frontend; the repository's UI is
-    intended to use a map.
--   **PowerShell** --- used for local endpoint load tests.
+| Component | Technology | Purpose |
+|---|---|---|
+| Backend | Go | HTTP API, ingestion, workers, application logic |
+| Database | PostgreSQL | Latest bus locations, rooms, and stops |
+| Database driver | pgx | PostgreSQL connection pooling and queries |
+| Frontend | HTML, CSS, JavaScript | Browser interface |
+| Map | Leaflet | Map rendering and interaction |
+| Map tiles | OpenStreetMap | Base map tiles |
+| Road geometry | OSRM | Road-following route geometry |
+| ETA API | Python + FastAPI | Prediction endpoint |
+| ML | NumPy + scikit-learn Linear Regression | Experimental ETA model |
+| Model serialization | joblib | Save/load model artifact |
+| Load testing | PowerShell | Local HTTP load tests |
 
 ## Run locally
 
-These steps are a general starting point. Adjust database name,
-credentials, and environment variable names to match
-`internal/store/postgres.go` and `cmd/server/main.go`.
-
 ### Prerequisites
 
--   Go installed.
--   PostgreSQL installed and running.
--   Git installed.
--   PowerShell is optional and only needed for the example test script.
+- Go version compatible with `go.mod`.
+- PostgreSQL installed and running.
+- Python 3.10+ recommended for the Python dependencies.
+- Git.
+- A browser with geolocation support for Track Me.
 
 ### 1. Clone the repository
 
-``` bash
+```bash
 git clone https://github.com/chidusurabhi123-collab/microtransit-go.git
 cd microtransit-go
 ```
 
-### 2. Configure environment variables
+### 2. Configure PostgreSQL
 
-Create a local `.env` file using the variables expected by the
-application. For example, a typical PostgreSQL configuration may look
-like:
+Create the database:
 
-``` dotenv
-DATABASE_URL=postgres://USERNAME:PASSWORD@localhost:5432/DATABASE_NAME?sslmode=disable
+```bash
+createdb microtransit
 ```
 
-**Important:** `DATABASE_URL` is an example name, not a guarantee that
-the current code reads that exact variable. Check the source and use its
-actual configuration keys. Do not commit real passwords, API keys, or
-production credentials.
+Apply the initial schema:
 
-### 3. Create the database and apply the migration
-
-Create a PostgreSQL database, then run the initial migration against it:
-
-``` bash
-createdb YOUR_DATABASE_NAME
-psql -d YOUR_DATABASE_NAME -f migrations/001_init.sql
+```bash
+psql -d microtransit -f migrations/001_init.sql
 ```
 
-If your local PostgreSQL setup requires a username or password, use your
-configured local authentication method. Avoid putting database passwords
-directly into shell history or source control.
+The Go entry point reads `DATABASE_URL`. Its current local fallback is:
 
-### 4. Download Go dependencies
-
-``` bash
-go mod download
+```text
+postgres://postgres:postgres@localhost:5432/microtransit?sslmode=disable
 ```
 
-### 5. Start the server
+Use your own local PostgreSQL credentials. Do not use the fallback credentials in a deployed environment.
 
-From the repository root:
+Create a local `.env` file in the repository root:
 
-``` bash
-go run ./cmd/server
+```dotenv
+DATABASE_URL=postgres://YOUR_USER:YOUR_PASSWORD@localhost:5432/microtransit?sslmode=disable
+PYTHON_ETA_URL=http://127.0.0.1:8000
 ```
 
-If the application expects a different working directory or
-configuration, follow the requirements in `cmd/server/main.go`. The
-observed local endpoint during testing was:
+The Go server calls `godotenv.Load()` from the repository root. Keep the real `.env` local and out of Git.
 
-``` text
-http://localhost:8080/api/bus/location
+### 3. Start the Python ETA service
+
+Open a terminal:
+
+```bash
+cd python-eta
+
+python -m venv .venv
 ```
 
-### 6. Open the frontend
+Activate the virtual environment.
 
-If the Go server serves the `static` directory, open the route
-configured in the server. Otherwise, serve `static/index.html` using the
-project's configured frontend workflow. The exact frontend URL depends
-on the server setup.
+Windows PowerShell:
 
-## API
-
-### Submit a bus location
-
-The endpoint used during local tests is:
-
-``` http
-POST http://localhost:8080/api/bus/location
-Content-Type: application/json
+```powershell
+.\.venv\Scripts\Activate.ps1
 ```
 
-Example request body:
+macOS/Linux:
 
-``` json
+```bash
+source .venv/bin/activate
+```
+
+Install dependencies:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+Train/generate the local model artifact:
+
+```bash
+python train.py
+```
+
+Start FastAPI:
+
+```bash
+python -m uvicorn app:app --host 127.0.0.1 --port 8000
+```
+
+Check health:
+
+```text
+http://127.0.0.1:8000/health
+```
+
+Test prediction:
+
+```bash
+curl -X POST http://127.0.0.1:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{"distance_km": 2.5, "speed_kmh": 30}'
+```
+
+Expected response shape:
+
+```json
 {
-  "bus_id": "MYS-101",
-  "lat": 12.2958,
-  "lng": 76.6323,
-  "speed": 45
+  "eta_minutes": 5.0,
+  "hour": 14
 }
 ```
 
-Fields used in the test payload:
+The numeric value depends on the current hour, model artifact, and generated training data. The example is illustrative.
 
-  Field      Meaning                                   Example
-  ---------- ----------------------------------------- -----------
-  `bus_id`   Bus identifier                            `MYS-101`
-  `lat`      Latitude                                  `12.2958`
-  `lng`      Longitude                                 `76.6323`
-  `speed`    Reported speed; confirm units in source   `45`
+### 4. Start the Go backend
 
-The accepted fields, validation rules, response body, status codes, and
-persistence semantics must be verified in `internal/handler/bus.go` and
-related code. Do not assume the example documents every validation rule.
+From the repository root, in a second terminal:
 
-### Example PowerShell request
-
-``` powershell
-$body = @{
-    bus_id = "MYS-101"
-    lat    = 12.2958
-    lng    = 76.6323
-    speed  = 45
-} | ConvertTo-Json -Compress
-
-Invoke-RestMethod `
-    -Method Post `
-    -Uri "http://localhost:8080/api/bus/location" `
-    -ContentType "application/json" `
-    -Body $body
+```bash
+go mod download
+go run ./cmd/server
 ```
 
-## Load-test notes
+The server listens on port `8080` and serves the frontend from `static/`.
 
-A local PowerShell test submitted 30,000 location requests to the
-endpoint using `ForEach-Object -Parallel`. The user reported the
-following two runs:
+Open:
 
-  --------------------------------------------------------------------------
-  Run           Attempts   Successful       Failed Elapsed time Reported RPS
-                            responses    responses              
-  --------- ------------ ------------ ------------ ------------ ------------
-  1               30,000       27,612        2,388     202.05 s          148
+```text
+http://localhost:8080/
+```
 
-<<<<<<< HEAD
-  2               30,000       30,000            0     259.56 s           88
-=======
-  2               30,000       30,000            0     289.56 s           88
->>>>>>> 21dd052 (feat: road-snapped route, shrinking blue line, Track Me fix, Palace final)
-  --------------------------------------------------------------------------
+**Current integration note:** Start the Python service so it is available for future Go integration and independent API testing. In the published source, the Go `/api/rooms/{room_id}/eta` handler still returns distance/progress fields without invoking `Eta.Predict`. Wire and test that call before claiming the UI/API displays Python-generated ETA.
 
-Run 1 had a reported failure rate of 7.96%. Run 2 completed with zero
-failed responses according to the test output.
+## API
 
-### Interpret these numbers carefully
+The following routes are registered by the published Go server:
 
--   These are local development-machine results, not a production
-    benchmark.
--   `ForEach-Object -Parallel` uses a bounded worker pool; this does
-    **not** mean 30,000 connections were open simultaneously.
--   The reported RPS values do not match `attempts / elapsed time` for
-    the displayed durations. Based on the supplied figures, the
-    approximate aggregate rates are:
-    -   Run 1: 30,000 / 202.05 ≈ 148.5 attempts/second.
-    -   Run 2: 30,000 / 259.56 ≈ 115.6 attempts/second.
--   The source of the second run's reported `88 RPS` should be checked:
-    the timer interval, numerator, or measurement scope may differ.
--   A PostgreSQL count of 30,001 was displayed after Run 2. That is not
-    automatically proof of exactly 30,000 new rows: an existing row, a
-    different table/count scope, or a duplicate can affect the count.
--   A successful HTTP response is not sufficient by itself to prove
-    durable storage. Verify the relevant table, unique identifiers, and
-    expected row count.
--   The first run's failures and second run's success show that
-    reliability should be retested and failure messages recorded.
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/bus/location` | Submit a GPS update |
+| `GET` | `/api/buses` | Get latest bus locations |
+| `POST` | `/api/rooms` | Create a route room |
+| `GET` | `/api/rooms/{room_id}` | Get room details |
+| `POST` | `/api/rooms/{room_id}/stops` | Add a stop (admin token required) |
+| `GET` | `/api/rooms/{room_id}/stops` | List room stops |
+| `GET` | `/api/rooms/{room_id}/eta` | Return route-distance/progress data |
 
-### Recommended benchmark procedure
+### Submit bus location
 
-1.  Record the exact commit, machine, Go version, PostgreSQL version,
-    worker limit, and test script.
-2.  Run a warm-up test, then at least three measured runs.
-3.  Store each request's result and full error message.
-4.  Calculate throughput using `completed requests / elapsed seconds`,
-    and state whether failed requests are included.
-5.  Measure p50, p95, and p99 response latency.
-6.  Check CPU, memory, database connections, database write latency, and
-    server logs.
-7.  Verify unique IDs and persisted records after each run.
-8.  Test increasing concurrency gradually, for example 10, 25, 50, and
-    100 workers.
-9.  Save benchmark output so later versions can be compared fairly.
+```http
+POST /api/bus/location
+Content-Type: application/json
+```
 
-Do not describe this as "30,000 simultaneous users" or
-"production-ready" based on the current test alone.
+```json
+{
+  "bus_id": "MYS-101",
+  "lat": 12.2958,
+  "lng": 76.6394,
+  "speed": 30
+}
+```
 
-## Security and configuration
+The handler submits the decoded location to the in-memory ingestion queue and responds with a queued status. A queued response is not proof that PostgreSQL has committed the write.
 
--   Keep `.env` out of Git. Commit a `.env.example` with placeholder
-    values instead.
--   If a real credential has ever been committed or shared, rotate it;
-    deleting the file in a later commit does not remove it from Git
-    history.
--   Validate latitude and longitude ranges and reject malformed or
-    unreasonable payloads.
--   Use parameterized SQL queries; never build SQL by concatenating
-    untrusted request data.
--   Add request timeouts, graceful shutdown, and bounded queues if the
-    ingestion path uses workers/channels.
--   Limit request body size and return consistent HTTP status codes.
--   Add authentication and rate limiting before exposing write endpoints
-    publicly.
--   Configure TLS and PostgreSQL access controls for deployed
-    environments.
--   Avoid logging passwords, tokens, or unnecessary personal/location
-    data.
--   Add database migrations that can be applied repeatably and tracked
-    in source control.
+### Create a room
+
+```http
+POST /api/rooms
+Content-Type: application/json
+```
+
+```json
+{
+  "name": "MYS-101"
+}
+```
+
+The response contains a room ID and an admin token. Treat the token as a secret.
+
+### Add a stop
+
+```http
+POST /api/rooms/MYS-101/stops
+Content-Type: application/json
+X-Admin-Token: YOUR_ADMIN_TOKEN
+```
+
+```json
+{
+  "name": "Kuvempunagar",
+  "lat": 12.2958,
+  "lng": 76.6394
+}
+```
+
+### List stops
+
+```http
+GET /api/rooms/MYS-101/stops
+```
+
+### Get route distance/progress data
+
+```http
+GET /api/rooms/MYS-101/eta
+```
+
+The current handler chooses the geographically nearest stop using Haversine distance and returns route-distance/progress fields. This is a prototype heuristic; loops, crossings, nearby parallel roads, and GPS noise can cause the nearest stop not to be the next stop along the route.
+
+### Python prediction API
+
+Health check:
+
+```http
+GET http://127.0.0.1:8000/health
+```
+
+Prediction:
+
+```http
+POST http://127.0.0.1:8000/predict
+Content-Type: application/json
+```
+
+```json
+{
+  "distance_km": 2.5,
+  "speed_kmh": 30
+}
+```
+
+Response shape:
+
+```json
+{
+  "eta_minutes": 5.0,
+  "hour": 14
+}
+```
+
+## ETA model: what it currently does
+
+`python-eta/train.py` creates 2,000 synthetic training rows. Its target is generated from a formula using distance, speed, a peak-hour traffic multiplier, and random noise. It fits a scikit-learn `LinearRegression` model and saves it as `model.pkl` using joblib.
+
+`python-eta/models.py` loads that artifact and predicts using four input features: distance, speed, hour, and traffic multiplier. If the model is unavailable, it falls back to the distance/speed formula.
+
+This is useful for proving the service boundary and model-serving workflow. It does **not** demonstrate that the model has learned real bus traffic patterns. For a credible transit ETA model, collect timestamped bus GPS histories and actual stop-arrival times, engineer route/time/traffic features, use a time-based train/validation split, and report MAE (mean absolute error) against a simple baseline.
+
+Also note that the current `/health` implementation returns `model_loaded: true` unconditionally. Improve it to report the actual model-loading state before relying on that field operationally.
+
+## Local load-test results
+
+The following local PowerShell results were reported during development:
+
+| Run | Attempts | Successful | Failed | Elapsed time | Reported RPS |
+|---|---:|---:|---:|---:|---:|
+| 1 | 30,000 | 27,612 | 2,388 | 202.05 s | 148 |
+| 2 | 30,000 | 30,000 | 0 | 259.56 s | 88 |
+
+Recalculated successful-response throughput:
+
+- Run 1: 27,612 / 202.05 ≈ **136.7 successful responses/second**.
+- Run 2: 30,000 / 259.56 ≈ **115.6 successful responses/second**.
+
+The reported RPS values do not match successful responses divided by elapsed time. For future benchmarks, define the numerator clearly, record the worker throttle limit, capture full error messages, and measure p50/p95/p99 latency. `ForEach-Object -Parallel` uses a bounded worker pool; 30,000 submitted requests does not mean 30,000 simultaneous open connections.
+
+A PostgreSQL total row count of 30,001 is not by itself proof that exactly 30,000 new updates were persisted. Verify test-run IDs or unique bus identifiers.
+
+These are local development measurements, not production capacity claims.
+
+## Known issues and next engineering tasks
+
+1. **Connect Go to Python:** the Go ETA client is created in `main.go`, but `StopHandler.GetETA` does not yet call `Eta.Predict`.
+2. **Check Python HTTP responses:** the Go client should check non-2xx status codes, JSON decode errors, request marshal errors, and invalid response values.
+3. **Handle zero speed:** avoid division by zero in the fallback ETA calculation.
+4. **Fix model health reporting:** `/health` should report the true model-loading state, not always `true`.
+5. **Replace synthetic training data:** use real timestamped journey data and actual arrival labels before making accuracy claims.
+6. **Fix room creation conflicts:** avoid returning a newly generated admin token when an existing room caused the insert to do nothing.
+7. **Use transactions for stop updates:** updating `dist_to_final` and inserting a stop must succeed or fail atomically.
+8. **Prevent concurrent stop-order races:** serialize route edits or enforce an appropriate database constraint.
+9. **Check all database errors:** do not silently discard query, scan, or row-iteration errors.
+10. **Improve route matching:** nearest-stop selection is not robust route-progress tracking.
+11. **Make ingestion durable if required:** the in-memory queue can lose acknowledged updates on process failure, and worker write failures are currently logged rather than retried.
+12. **Protect secrets:** remove `.env` from Git and rotate any real credentials that were exposed.
 
 ## Roadmap
 
-### V1 --- Core tracking backend
+### Core tracking and map
 
--   [x] Go server and bus location endpoint exist.
--   [x] PostgreSQL persistence is integrated.
--   [x] Static frontend exists.
--   [x] Local tests have been run with 10,000 sequential requests and
-    30,000 requests through a parallel PowerShell test.
--   [ ] Make the benchmark repeatable and reconcile RPS calculations.
--   [ ] Verify data integrity with unique IDs and database assertions.
--   [ ] Add automated unit and integration tests.
+- [x] Go HTTP server and bus-location endpoint.
+- [x] PostgreSQL latest-location storage.
+- [x] Buffered ingestion queue and worker goroutines.
+- [x] Leaflet map and bus/stop markers.
+- [x] Room and stop API scaffolding.
+- [x] OSRM road-geometry attempt with fallback.
+- [x] Browser geolocation control.
 
-### V2 --- Reliability and observability
+### ETA service
 
--   [ ] Structured logging and request IDs.
--   [ ] Metrics for request count, error count, latency, queue depth,
-    and database operations.
--   [ ] Graceful shutdown and correct cancellation of workers.
--   [ ] Input validation and consistent API error responses.
--   [ ] Database migration workflow and automated integration tests.
--   [ ] Repeatable load test with p50/p95/p99 latency and resource
-    measurements.
--   [ ] Docker-based local development and CI checks.
+- [x] Python FastAPI `/health` and `/predict` endpoints.
+- [x] Synthetic-data Linear Regression training script.
+- [x] Model serialization/loading with joblib.
+- [x] Mathematical fallback when no model is loaded.
+- [ ] Call the Python service from the Go route ETA handler.
+- [ ] Validate service errors, timeouts, and fallback behavior.
+- [ ] Collect real bus journey and stop-arrival data.
+- [ ] Evaluate model against a baseline with time-separated validation.
+- [ ] Report MAE and monitor prediction quality.
 
-### V3 --- Targeted C++ optimization
+### Reliability and deployment
 
-C++ is planned for components where profiling shows a real CPU-bound
-bottleneck. Do not add a second language purely because it may be faster
-in isolation. Define a narrow interface and benchmark the complete
-Go-to-C++ path, including data conversion and inter-process or FFI
-overhead.
+- [ ] Automated Go unit and integration tests.
+- [ ] Python tests for model loading, inputs, and predictions.
+- [ ] Go-to-Python integration tests.
+- [ ] Transaction-safe stop updates and route-order constraints.
+- [ ] Graceful shutdown and worker lifecycle management.
+- [ ] Retry/dead-letter handling for failed GPS writes.
+- [ ] Structured logs and request metrics.
+- [ ] Repeatable load tests with latency percentiles.
+- [ ] Docker Compose for Go, PostgreSQL, and Python.
+- [ ] CI checks, HTTPS, rate limits, and stronger authentication.
 
-Potential future use cases could include expensive route calculations or
-high-volume geospatial computations, if those are proven to be
-bottlenecks.
+## Security and configuration
 
-### V4 --- Python bus arrival-time prediction
+- Do not commit `.env`. Commit `.env.example` with placeholder values only.
+- If a real password, token, or connection string has been committed to a public repository, rotate it. Removing the file in a later commit does not remove it from Git history.
+- Treat `X-Admin-Token` as a bearer secret.
+- Use HTTPS outside localhost.
+- Validate request bodies, coordinate ranges, IDs, and speed values.
+- Use parameterized SQL, request timeouts, body-size limits, and rate limiting.
+- Restrict PostgreSQL access and use a least-privilege database role.
+- The public OSRM demo service is an external dependency, not a production SLA.
 
--   [ ] Collect historical GPS observations with timestamps.
--   [ ] Obtain or derive trustworthy actual arrival-time labels.
--   [ ] Build features such as route, stop, time of day, day of week,
-    speed, and historical travel duration.
--   [ ] Establish a simple baseline model before trying complex ML.
--   [ ] Evaluate prediction error on time-separated validation data.
--   [ ] Serve predictions through a separate Python API or model
-    service.
--   [ ] Monitor prediction accuracy and data drift.
+## License
 
-A model needs relevant historical data and reliable labels; GPS update
-volume alone does not guarantee useful predictions.
-
-### V5 --- Integrated system
-
--   Go: HTTP APIs, ingestion, and orchestration.
--   PostgreSQL: operational state and historical location records.
--   C++: only proven performance-critical components.
--   Python: model training and prediction service.
--   Monitoring and load testing: validate the complete system under
-    realistic traffic.
-
-## Known limitations and next steps
-
-This README documents the repository layout and the test results
-reported during development. It does not independently establish
-production readiness, a maximum supported request rate, zero data loss
-under every failure mode, or the exact behavior of every code path.
-
-The highest-value next steps are to inspect the implementation, add
-automated tests, reconcile the benchmark's RPS calculation, capture
-errors, and verify persisted records by unique request ID.
+This project is intended to be distributed under the MIT License. See [`LICENSE`](LICENSE). Ensure the `LICENSE` file is committed at the repository root.
 
 ## Contributing
 
-For changes:
+1. Create a focused branch.
+2. Add or update tests for behavior changes.
+3. Format and test Go:
 
-1.  Create a focused branch.
+   ```bash
+   gofmt -w .
+   go test ./...
+   ```
 
-2.  Add or update tests.
-
-3.  Run formatting and tests:
-
-    ``` bash
-    gofmt -w .
-    go test ./...
-    ```
-
-4.  Run the benchmark with a recorded configuration.
-
-5.  Document behavior changes and benchmark results.
+4. Test the Python service and Go-to-Python integration.
+5. Record benchmark configuration and results.
+6. Update this README when routes, environment variables, or behavior change.
