@@ -1,27 +1,35 @@
-from pathlib import Path
+import os
 
-import joblib
-import numpy as np
+try:
+    import joblib  # type: ignore
+except ImportError:
+    joblib = None  # type: ignore
 
-BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR / "model.pkl"
-model = None
-
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "eta_model.pkl")
+model = None  # type: ignore
 
 def load_model():
     global model
-    if MODEL_PATH.exists():
-        model = joblib.load(MODEL_PATH)
-    return model
+    if not os.path.exists(MODEL_PATH):
+        print(f"[ETA] No model file, using fallback")
+        return None
+    if joblib is None:
+        return None
+    try:
+        model = joblib.load(MODEL_PATH)  # type: ignore
+        print("[ETA] Model loaded")
+        return model
+    except Exception as e:
+        print(f"[ETA] Failed to load ({e}), fallback")
+        model = None
+        return None
 
-
-def predict_eta(distance_km: float, speed_kmh: float, hour: int):
-    global model
-    if model is None:
-        load_model()
-    traffic = 1.4 if hour in [8, 9, 10, 17, 18, 19] else 1.0
-    # fallback if no model
-    if model is None:
-        return distance_km / max(speed_kmh, 5) * 60 * traffic
-    X = np.array([[distance_km, speed_kmh, hour, traffic]], dtype=float)
-    return float(model.predict(X)[0])
+def predict_eta(distance_km: float, speed_kmh: float) -> float:
+    if speed_kmh < 1:
+        return 0
+    if model is not None:
+        try:
+            return float(model.predict([[distance_km, speed_kmh]])[0])  # type: ignore
+        except:
+            pass
+    return distance_km / speed_kmh * 60

@@ -23,26 +23,39 @@ func New(url string) *Client {
 	return &Client{baseURL: url, httpClient: &http.Client{Timeout: 2 * time.Second}}
 }
 
+type predictReq struct {
+	Distance float64 `json:"distance"`
+	Speed    float64 `json:"speed"`
+}
+
+type predictResp struct {
+	EtaMinutes float64 `json:"eta_minutes"`
+	Eta        float64 `json:"eta"`
+}
+
 func (c *Client) Predict(distKm, speedKmh float64) (float64, error) {
 	if speedKmh < 1 {
 		return 0, nil
 	}
+	// fallback if Python down
+	fallback := distKm / speedKmh * 60
+
 	if c.baseURL == "" {
-		return distKm / speedKmh * 60, nil
+		return fallback, nil
 	}
-	body, _ := json.Marshal(map[string]float64{"distance": distKm, "speed": speedKmh})
+	body, _ := json.Marshal(predictReq{Distance: distKm, Speed: speedKmh})
 	resp, err := c.httpClient.Post(c.baseURL+"/predict", "application/json", bytes.NewReader(body))
 	if err != nil {
-		return distKm / speedKmh * 60, nil
+		return fallback, nil
 	}
 	defer resp.Body.Close()
-	var out struct{ EtaMinutes float64 `json:"eta_minutes"`; Eta float64 `json:"eta"` }
+	var out predictResp
 	json.NewDecoder(resp.Body).Decode(&out)
-	if out.EtaMinutes != 0 {
+	if out.EtaMinutes > 0 {
 		return out.EtaMinutes, nil
 	}
-	if out.Eta != 0 {
+	if out.Eta > 0 {
 		return out.Eta, nil
 	}
-	return distKm / speedKmh * 60, nil
+	return fallback, nil
 }
