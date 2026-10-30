@@ -1,4 +1,10 @@
+@"
 .env
 *.exe
-/microtransit-go
-/python-eta/__pycache__/
+__pycache__/
+.venv/
+venv/
+python-eta/venv/
+python-eta/__pycache__/
+python-eta/eta_model.pkl
+"@ | Out-File -Append .gitignore -Encoding utf8
