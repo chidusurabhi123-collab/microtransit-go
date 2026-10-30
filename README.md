@@ -285,7 +285,11 @@ following two runs:
   --------- ------------ ------------ ------------ ------------ ------------
   1               30,000       27,612        2,388     202.05 s          148
 
+<<<<<<< HEAD
   2               30,000       30,000            0     259.56 s           88
+=======
+  2               30,000       30,000            0     289.56 s           88
+>>>>>>> 21dd052 (feat: road-snapped route, shrinking blue line, Track Me fix, Palace final)
   --------------------------------------------------------------------------
 
 Run 1 had a reported failure rate of 7.96%. Run 2 completed with zero

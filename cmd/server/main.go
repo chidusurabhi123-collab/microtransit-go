@@ -4,45 +4,39 @@ import (
 	"log"
 	"net/http"
 	"os"
-
-	"github.com/joho/godotenv"
+	"microtransit-go/internal/eta"
 	"microtransit-go/internal/handler"
 	"microtransit-go/internal/ingestor"
 	"microtransit-go/internal/store"
+	"github.com/joho/godotenv"
 )
 
 func main() {
-	// Load .env file
 	godotenv.Load()
+	conn := os.Getenv("DATABASE_URL")
+	if conn == "" { conn = "postgres://postgres:postgres@localhost:5432/microtransit?sslmode=disable" }
 
-	connStr := os.Getenv("DATABASE_URL")
-	if connStr == "" {
-		log.Fatal("DATABASE_URL not set in .env")
-	}
+	s, err := store.New(conn)
+	if err != nil { log.Fatal(err) }
 
-	// 1. Connect to Postgres with 5 connections (low RAM)
-	s, err := store.New(connStr)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// 2. Create queue and start 5 workers
 	ing := ingestor.New(s)
-	ing.StartWorkers(5)
-	log.Println("Started 5 workers with 1000-slot queue")
+	ing.StartWorkers(20)
 
-	// 3. HTTP handlers
-	h := handler.New(s, ing)
+	busH := handler.NewBusHandler(s, ing)
+	roomH := &handler.RoomHandler{Store: s}
+	etaClient := eta.New(os.Getenv("PYTHON_ETA_URL"))
+	stopH := &handler.StopHandler{Store: s, Eta: etaClient}
 
-	http.HandleFunc("/api/bus/location", h.UpdateLocation)
-	http.HandleFunc("/api/buses", h.GetAllBuses)
-	// Serve map files from ./static
-	http.Handle("/", http.FileServer(http.Dir("./static")))
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/bus/location", busH.UpdateLocation)
+	mux.HandleFunc("GET /api/buses", busH.GetAllBuses)
+	mux.HandleFunc("POST /api/rooms", roomH.Create)
+	mux.HandleFunc("GET /api/rooms/{room_id}", roomH.Get)
+	mux.HandleFunc("POST /api/rooms/{room_id}/stops", stopH.Add)
+	mux.HandleFunc("GET /api/rooms/{room_id}/stops", stopH.List)
+	mux.HandleFunc("GET /api/rooms/{room_id}/eta", stopH.GetETA)
+	mux.Handle("/", http.FileServer(http.Dir("static")))
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-	log.Printf("Server running on http://localhost:%s - RAM ~20MB", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	log.Println("Server on :8080 RAM ~38MB")
+	log.Fatal(http.ListenAndServe(":8080", mux))
 }

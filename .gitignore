@@ -1,0 +1,4 @@
+.env
+*.exe
+/microtransit-go
+/python-eta/__pycache__/

@@ -1,70 +1,111 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>MicroTransit - Live Map</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-  <!-- CHANGED 1: Added cluster CSS - free from GitHub -->
-  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.4.1/dist/MarkerCluster.css" />
-  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.4.1/dist/MarkerCluster.Default.css" />
+  <meta charset="utf-8"/>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.4.1/dist/MarkerCluster.css"/>
   <style>
-    body { margin:0; font-family: monospace; }
-    #map { height: 90vh; }
-    #header { padding:10px; background:#000; color:#0f0; display:flex; justify-content:space-between; }
+    body{margin:0} #map{height:100vh}
+    .eta-box{position:absolute;top:10px;right:10px;z-index:1000;background:white;padding:10px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.2);font-family:monospace}
+    .btn-track{position:absolute;bottom:20px;left:50%;transform:translateX(-50%);z-index:1000;background:#0984e3;color:white;border:none;padding:10px 18px;border-radius:20px;cursor:pointer}
+    .stop-num{background:#00b894;color:white;border-radius:50%;width:22px;height:22px;display:flex;align-items:center;justify-content:center;font-size:12px;border:2px solid white}
   </style>
 </head>
 <body>
-  <div id="header">
-    <div>MicroTransit-GO | 5 workers | 1000 queue | RAM ~20MB | Cluster ON</div>
-    <div id="count">0 buses live</div>
-  </div>
-  <div id="map"></div>
+<div id="map"></div>
+<div class="eta-box" id="eta">Loading route...</div>
+<button class="btn-track" id="trackBtn">📍 Track Me</button>
 
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <!-- CHANGED 2: Added cluster JS -->
-  <script src="https://unpkg.com/leaflet.markercluster@1.4.1/dist/leaflet.markercluster.js"></script>
-  <script>
-    const map = L.map('map').setView([12.2958, 76.6394], 13);
-    
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      attribution: '© OpenStreetMap'
-    }).addTo(map);
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.markercluster@1.4.1/dist/leaflet.markercluster.js"></script>
+<script>
+const map = L.map('map').setView([12.2958,76.6394],13);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+const cluster = L.markerClusterGroup({disableClusteringAtZoom:16});
+map.addLayer(cluster);
 
-    // CHANGED 3: Create cluster group instead of adding markers directly to map
-    const clusterGroup = L.markerClusterGroup();
-    map.addLayer(clusterGroup);
+const busIcon = L.divIcon({html:'🚌', className:'', iconSize:[30,30]});
+const finalIcon = L.divIcon({html:'🏰', className:'', iconSize:[30,30]});
 
-    let markers = {};
+let busMarkers={}, stopMarkers=[], remainingLine=null, firstLoad=true;
+let cachedStops=[], cachedRoad=[];
 
-    async function updateBuses() {
-      const res = await fetch('/api/buses');
-      const buses = await res.json();
-      
-      document.getElementById('count').innerText = buses.length + ' buses live';
-
-      buses.forEach(b => {
-        if (!markers[b.bus_id]) {
-          // New bus = add to cluster group, not directly to map
-          markers[b.bus_id] = L.marker([b.lat, b.lng])
-            .bindPopup(`<b>${b.bus_id}</b><br>Speed: ${b.speed} km/h`);
-          clusterGroup.addLayer(markers[b.bus_id]); // CHANGED 4
-        } else {
-          markers[b.bus_id].setLatLng([b.lat, b.lng]);
-        }
-      });
+async function getRoad(a,b){
+  // try OSRM, if fails return straight line
+  try{
+    const url = `https://router.project-osrm.org/route/v1/driving/${a.lng},${a.lat};${b.lng},${b.lat}?overview=full&geometries=geojson`;
+    const r = await fetch(url);
+    const j = await r.json();
+    if(j.routes && j.routes[0]){
+      return j.routes[0].geometry.coordinates.map(c=>[c[1],c[0]]);
     }
+  }catch(e){ console.log("OSRM blocked, using straight line"); }
+  return [[a.lat,a.lng],[b.lat,b.lng]];
+}
 
-    setInterval(updateBuses, 3000);
-    updateBuses();
+async function loadRoute(){
+  stopMarkers.forEach(m=>map.removeLayer(m)); stopMarkers=[];
+  const stops = await fetch('/api/rooms/MYS-101/stops').then(r=>r.json()).catch(()=>[]);
+  if(!stops.length){ document.getElementById('eta').innerText="No stops"; return []; }
+  cachedStops = stops;
 
-    map.on('click', async (e) => {
-      const bus_id = 'MYS-TEST';
-      await fetch('/api/bus/location', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({bus_id: bus_id, lat: e.latlng.lat, lng: e.latlng.lng, speed: 25})
-      });
-    });
-  </script>
+  stops.forEach((s,i)=>{
+    const m = L.marker([s.lat,s.lng],{icon: i===stops.length-1? finalIcon : L.divIcon({html:`${i+1}`, className:'stop-num'})}).addTo(map).bindPopup(s.name);
+    stopMarkers.push(m);
+  });
+
+  // 1. DRAW STRAIGHT LINE IMMEDIATELY - so you always see road
+  const straight = stops.map(s=>[s.lat,s.lng]);
+  if(window.baseLine) map.removeLayer(window.baseLine);
+  window.baseLine = L.polyline(straight, {color:'#0984e3', weight:6, opacity:0.9}).addTo(map);
+  if(firstLoad){ map.fitBounds(window.baseLine.getBounds(), {padding:[30,30]}); firstLoad=false; }
+
+  // 2. TRY TO UPGRADE TO REAL ROAD (on top)
+  cachedRoad = [];
+  for(let i=0;i<stops.length-1;i++){
+    const seg = await getRoad(stops[i], stops[i+1]);
+    cachedRoad = cachedRoad.concat(seg);
+  }
+  if(cachedRoad.length>straight.length){
+    window.baseLine.setLatLngs(cachedRoad); // replace straight with road-snapped
+  }
+  return stops;
+}
+
+async function loadBuses(){
+  const [buses, etaRes] = await Promise.all([
+    fetch('/api/buses').then(r=>r.json()).catch(()=>[]),
+    fetch('/api/rooms/MYS-101/eta').then(r=>r.json()).catch(()=>null)
+  ]);
+  const bus = buses.find(b=>b.bus_id==='MYS-101');
+  if(!bus || !cachedStops.length) return;
+
+  if(etaRes){
+    document.getElementById('eta').innerHTML = `Total: ${etaRes.total_km.toFixed(2)} km<br>Remaining: <b style="color:#0984e3">${etaRes.remaining_km.toFixed(2)} km</b> to ${etaRes.next_name}<br>Next: ${etaRes.next_km.toFixed(2)} km`;
+  }
+
+  const nextIdx = etaRes?.next_idx ?? 0;
+  const remainingPath = [[bus.lat,bus.lng], ...cachedStops.slice(nextIdx).map(s=>[s.lat,s.lng])];
+  
+  if(remainingLine) map.removeLayer(remainingLine);
+  remainingLine = L.polyline(remainingPath, {color:'#0984e3', weight:6, opacity:0.9}).addTo(map);
+
+  if(!busMarkers[bus.bus_id]){
+    busMarkers[bus.bus_id]=L.marker([bus.lat,bus.lng],{icon:busIcon}).addTo(map);
+    cluster.addLayer(busMarkers[bus.bus_id]);
+  } else busMarkers[bus.bus_id].setLatLng([bus.lat,bus.lng]);
+}
+
+let youMarker=null;
+navigator.geolocation.watchPosition(p=>{
+  const pos=[p.coords.latitude,p.coords.longitude];
+  if(!youMarker) youMarker=L.circleMarker(pos,{radius:9,color:'white',fillColor:'#0984e3',fillOpacity:1,weight:3}).addTo(map);
+  else youMarker.setLatLng(pos);
+}, null, {enableHighAccuracy:true});
+
+document.getElementById('trackBtn').onclick=()=>{ if(youMarker) map.flyTo(youMarker.getLatLng(),16); };
+
+loadRoute().then(()=>{ setInterval(loadBuses,3000); loadBuses(); });
+</script>
 </body>
 </html>

@@ -19,7 +19,7 @@ func New(s *store.Store) *Ingestor {
 		// WHY 1000? If DB is slow for 2 sec, we can still collect 1000 pings
 		// without dropping. After 1000, handler will wait (backpressure)
 		// This prevents memory from growing to infinity = low RAM
-		ch:    make(chan models.Location, 1000),
+		ch:    make(chan models.Location, 30000),
 		store: s,
 	}
 }
